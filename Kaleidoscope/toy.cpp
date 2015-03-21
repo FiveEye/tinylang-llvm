@@ -4,6 +4,10 @@
 #include <map>
 #include <string>
 #include <vector>
+#include "llvm/Analysis/Passes.h"
+#include "llvm/ExecutionEngine/ExecutionEngine.h"
+#include "llvm/ExecutionEngine/MCJIT.h"
+#include "llvm/ExecutionEngine/SectionMemoryManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
@@ -381,11 +385,21 @@ static void HandleExtern() {
   }
 }
 
+static ExecutionEngine *TheExecutionEngine;
+
 static void HandleTopLevelExpression() {
   if(FunctionAST *F = ParseTopLevelExpr()) {
     if(Function *LF = F->Codegen()) {
       fprintf(stderr, "Parsed a top-level expr\n");
       LF->dump();
+
+      void *FPtr = TheExecutionEngine->getPointerToFunction(LF);
+      if(!FPtr) {
+        fprintf(stderr, "FPtr == NULL\n");
+        return ;
+      }
+      double (*FP)() = (double (*)())(intptr_t)FPtr;
+      fprintf(stderr, "Evaluated to %f\n", FP());
     }
   } else {
     getNextToken();
@@ -413,8 +427,8 @@ double putchard(double x) {
   return 0;
 }
 
-
 // Main
+
 
 int main() {
   LLVMContext &Context = getGlobalContext();
@@ -428,6 +442,8 @@ int main() {
   getNextToken();
 
   TheModule = new Module("my cool jit", Context);
+
+  TheExecutionEngine = EngineBuilder(TheModule).create();
 
   MainLoop();
 
