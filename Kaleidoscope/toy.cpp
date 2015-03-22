@@ -8,11 +8,15 @@
 #include "llvm/ExecutionEngine/ExecutionEngine.h"
 #include "llvm/ExecutionEngine/MCJIT.h"
 #include "llvm/ExecutionEngine/SectionMemoryManager.h"
-#include "llvm/IR/Verifier.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Transforms/Scalar.h"
 
 using namespace llvm;
 
@@ -267,9 +271,199 @@ static PrototypeAST *ParseExtern() {
   return ParsePrototype();
 }
 
+// MCJIT helper
+
+std::string GenerateUniqueName(const char *root) {
+  static int i = 0;
+  char s[16];
+  sprintf(s, "%s%d", root, i++);
+  std::string S = s;
+  return S;
+}
+
+std::string MakeLegalFunctionName(std::string Name) {
+  std::string NewName;
+  if(!Name.length()) {
+    return GenerateUniqueName("anon_func_");
+  }
+  NewName = Name;
+  if(NewName.find_first_of("0123456789") == 0) {
+    NewName.insert(0, 1, 'n');
+  }
+
+  std::string legal_elements =
+    "_abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+  size_t pos;
+  while((pos = NewName.find_first_not_of(legal_elements)) != std::string::npos) {
+    char old_c = NewName.at(pos);
+    char new_str[16];
+    sprintf(new_str, "%d", (int)old_c);
+    NewName = NewName.replace(pos, 1, new_str);
+  }
+
+  return NewName;
+}
+
+class MCJITHelper {
+public:
+  MCJITHelper(LLVMContext &C) : Context(C), OpenModule(NULL) {}
+  ~MCJITHelper();
+
+  Function *getFunction(const std::string FnName);
+  Module *getModuleForNewFunction();
+  void *getPointerToFunction(Function *F);
+  void *getSymbolAddress(const std::string &Name);
+  void dump();
+
+private:
+  typedef std::vector<Module *> ModuleVector;
+  typedef std::vector<ExecutionEngine *> EngineVector;
+
+  LLVMContext &Context;
+  Module *OpenModule;
+  ModuleVector Modules;
+  EngineVector Engines;
+};
+
+class HelpingMemoryManager : public SectionMemoryManager {
+  HelpingMemoryManager(const HelpingMemoryManager &) = delete;
+  void operator=(const HelpingMemoryManager &) = delete;
+
+public:
+  HelpingMemoryManager(MCJITHelper *Helper) : MasterHelper(Helper) {}
+  virtual ~HelpingMemoryManager() {}
+
+  virtual uint64_t getSymbolAddress(const std::string &Name) override;
+
+private:
+  MCJITHelper *MasterHelper;
+
+};
+
+uint64_t HelpingMemoryManager::getSymbolAddress(const std::string &Name) {
+  uint64_t pfn = RTDyldMemoryManager::getSymbolAddress(Name);
+  if(pfn) return pfn;
+
+  pfn = (uint64_t)MasterHelper->getSymbolAddress(Name);
+  if(!pfn) report_fatal_error("Program used extern function '" + Name + "' which could not be resolved!");
+
+  return pfn;
+}
+
+MCJITHelper::~MCJITHelper() {
+  if(OpenModule) delete OpenModule;
+  EngineVector::iterator begin = Engines.begin();
+  EngineVector::iterator end = Engines.end();
+  EngineVector::iterator it;
+  for(it = begin; it != end; ++it) delete *it;
+
+}
+
+Function *MCJITHelper::getFunction(const std::string FnName) {
+  ModuleVector::iterator begin = Modules.begin();
+  ModuleVector::iterator end = Modules.end();
+  ModuleVector::iterator it;
+  for(it = begin; it != end; ++it) {
+    Function *F = (*it)->getFunction(FnName);
+    if(F) {
+      if(*it == OpenModule) return F;
+
+      assert(OpenModule != NULL);
+
+      Function *PF = OpenModule->getFunction(FnName);
+      if(PF && !PF->empty()) {
+        ErrorF("redefinition of function across modules");
+        return 0;
+      }
+
+      if(!PF) PF = Function::Create(F->getFunctionType(), Function::ExternalLinkage, FnName, OpenModule);
+
+      return PF;
+
+    }
+  }
+  return NULL;
+}
+
+Module *MCJITHelper::getModuleForNewFunction() {
+  if(OpenModule) return OpenModule;
+
+  std::string ModName = GenerateUniqueName("mcjit_module_");
+  Module *M = new Module(ModName, Context);
+  Modules.push_back(M);
+  OpenModule = M;
+  return M;
+}
+
+void *MCJITHelper::getPointerToFunction(Function *F) {
+  EngineVector::iterator begin = Engines.begin();
+  EngineVector::iterator end = Engines.end();
+  for(auto it = begin; it != end; ++it) {
+    void *P = (*it)->getPointerToFunction(F);
+    if(P) return P;
+  }
+
+  if(OpenModule) {
+    std::string ErrStr;
+    ExecutionEngine *NewEngine =
+      EngineBuilder(OpenModule)
+        .setErrorStr(&ErrStr)
+        .setMCJITMemoryManager(
+          new HelpingMemoryManager(this))
+        .create();
+    if(!NewEngine) {
+      fprintf(stderr, "Could not create ExecutionEngine: %s\n", ErrStr.c_str());
+      exit(1);
+    }
+
+    auto *FPM = new legacy::FunctionPassManager(OpenModule);
+
+    OpenModule->setDataLayout(NewEngine->getDataLayout());
+    FPM->add(createBasicAliasAnalysisPass());
+    FPM->add(createPromoteMemoryToRegisterPass());
+    FPM->add(createInstructionCombiningPass());
+    FPM->add(createReassociatePass());
+    FPM->add(createGVNPass());
+    FPM->add(createCFGSimplificationPass());
+    FPM->doInitialization();
+
+    Module::iterator it;
+    Module::iterator end = OpenModule->end();
+    for(it = OpenModule->begin(); it != end; ++it) {
+      FPM->run(*it);
+    }
+
+    delete FPM;
+
+    OpenModule = NULL;
+    Engines.push_back(NewEngine);
+    NewEngine->finalizeObject();
+    return NewEngine->getPointerToFunction(F);
+  }
+  return NULL;
+}
+
+void *MCJITHelper::getSymbolAddress(const std::string &Name) {
+  EngineVector::iterator begin = Engines.begin();
+  EngineVector::iterator end = Engines.end();
+  EngineVector::iterator it;
+  for(it = begin; it != end; ++it) {
+    uint64_t FAddr = (*it)->getFunctionAddress(Name);
+    if(FAddr) return (void *)FAddr;
+  }
+  return NULL;
+}
+
+void MCJITHelper::dump() {
+  for(auto it = Modules.begin(); it != Modules.end(); ++it) {
+      (*it)->dump();
+  }
+}
+
 // Code Generation
 
-static Module *TheModule;
+//static Module *TheModule;
+static MCJITHelper *JITHelper;
 static IRBuilder<> Builder(getGlobalContext());
 static std::map<std::string, Value*> NamedValues;
 
@@ -299,7 +493,7 @@ Value *BinaryExprAST::Codegen() {
 }
 
 Value *CallExprAST::Codegen() {
-  Function *CalleeF = TheModule->getFunction(Callee);
+  Function *CalleeF = JITHelper->getFunction(Callee);
   if(CalleeF == 0) return ErrorV("Unknown function referenced");
 
   if(CalleeF->arg_size() != Args.size()) return ErrorV("Incorrect # arguments passed");
@@ -316,11 +510,13 @@ Value *CallExprAST::Codegen() {
 Function *PrototypeAST::Codegen() {
   std::vector<Type*> Doubles(Args.size(), Type::getDoubleTy(getGlobalContext()));
   FunctionType *FT = FunctionType::get(Type::getDoubleTy(getGlobalContext()), Doubles, false);
-  Function *F = Function::Create(FT, Function::ExternalLinkage, Name, TheModule);
+  std::string FnName = MakeLegalFunctionName(Name);
+  Module *M = JITHelper->getModuleForNewFunction();
+  Function *F = Function::Create(FT, Function::ExternalLinkage, FnName, M);
 
-  if(F->getName() != Name) {
+  if(F->getName() != FnName) {
     F->eraseFromParent();
-    F = TheModule->getFunction(Name);
+    F = JITHelper->getFunction(Name);
 
     if(!F->empty()) {
       ErrorF("redefinition of function");
@@ -385,19 +581,10 @@ static void HandleExtern() {
   }
 }
 
-static ExecutionEngine *TheExecutionEngine;
-
 static void HandleTopLevelExpression() {
   if(FunctionAST *F = ParseTopLevelExpr()) {
     if(Function *LF = F->Codegen()) {
-      fprintf(stderr, "Parsed a top-level expr\n");
-      LF->dump();
-
-      void *FPtr = TheExecutionEngine->getPointerToFunction(LF);
-      if(!FPtr) {
-        fprintf(stderr, "FPtr == NULL\n");
-        return ;
-      }
+      void *FPtr = JITHelper->getPointerToFunction(LF);
       double (*FP)() = (double (*)())(intptr_t)FPtr;
       fprintf(stderr, "Evaluated to %f\n", FP());
     }
@@ -431,7 +618,12 @@ double putchard(double x) {
 
 
 int main() {
+  InitializeNativeTarget();
+  InitializeNativeTargetAsmPrinter();
+  InitializeNativeTargetAsmParser();
+
   LLVMContext &Context = getGlobalContext();
+  JITHelper = new MCJITHelper(Context);
 
   BinopPrecedence['<'] = 10;
   BinopPrecedence['+'] = 20;
@@ -441,13 +633,9 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  TheModule = new Module("my cool jit", Context);
-
-  TheExecutionEngine = EngineBuilder(TheModule).create();
-
   MainLoop();
 
-  TheModule->dump();
+  JITHelper->dump();
 
   //while(1) printf("%d\n", gettok());
   return 0;
